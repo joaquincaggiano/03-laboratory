@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { ChatCompletion } from "openai/resources";
+import { ChatCompletionMessageParam } from "openai/resources.js";
 
 const client = new OpenAI(); // lee OPENAI_API_KEY y OPENAI_BASE_URL del entorno
 const MODELO = process.env.MODELO ?? "fast";
@@ -11,11 +12,21 @@ const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
     json: { type: "boolean", default: false },
-    // "max-tokens": { type: "string" },
+    "max-tokens": { type: "string" },
     // timeout: { type: "string" },
     // stream: { type: "boolean", default: false },
   },
 });
+
+// Límite de tokens de la respuesta
+let maxTokens = 256;
+if (values["max-tokens"]) {
+  maxTokens = parseInt(values["max-tokens"], 10);
+  if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
+    console.error("--max-tokens debe ser un entero positivo.");
+    process.exit(1);
+  }
+}
 
 // Obtenemos el prompt desde la línea de comandos
 let prompt = positionals[0];
@@ -23,7 +34,7 @@ let prompt = positionals[0];
 // Si no se proporcionó un prompt, mostramos un mensaje de como se utiliza la aplicación
 if (!prompt) {
   console.error(
-    `Para utilizar la aplicación, debes proporcionar un texto o archivo luego de ejecutar el comando:\n- npx tsx app.ts "<texto>" | <ruta-a-archivo> [--json]\n\nResume un texto en 3 puntos principales.\nOpciones:\n- --json: muestra la respuesta completa del modelo en formato JSON.\n\nEjemplos:\n- npx tsx app.ts "Javascript es un lenguaje de programación ..."\n- npx tsx app.ts docs/texto.txt\n- npx tsx app.ts docs/texto.txt --json`,
+    `Para utilizar la aplicación, debes proporcionar un texto o archivo luego de ejecutar el comando:\n- npx tsx app.ts "<texto>" | <ruta-a-archivo> [--json]\n\nResume un texto en 3 puntos principales.\nOpciones:\n- --json: muestra la respuesta completa del modelo en formato JSON.\n- --max-tokens: límite de tokens de la respuesta (por defecto: 256).\n\nEjemplos:\n- npx tsx app.ts "Javascript es un lenguaje de programación ..."\n- npx tsx app.ts docs/texto.txt\n- npx tsx app.ts docs/texto.txt --json`,
   );
   process.exit(1);
 }
@@ -57,19 +68,40 @@ const readResponse = (res: ChatCompletion) => {
   };
 };
 
-const response = await client.chat.completions.create({
-  model: MODELO,
-  messages: [
-    {
-      role: "system",
-      content: "Resume el texto del usuario en 3 puntos principales.",
-    },
-    {
-      role: "user",
-      content: prompt,
-    },
-  ],
-  max_completion_tokens: 256, // límite de la respuesta, en tokens
+const callModel = async ({
+  client,
+  system,
+  messages,
+  maxTokens,
+  stop,
+}: {
+  client: OpenAI;
+  system: string;
+  messages: ChatCompletionMessageParam[];
+  maxTokens: number;
+  stop?: string | string[];
+}): Promise<ChatCompletion> => {
+  const response = await client.chat.completions.create({
+    model: MODELO,
+    messages: [
+      {
+        role: "system",
+        content: system,
+      },
+      ...messages,
+    ],
+    max_completion_tokens: maxTokens,
+    stop: stop,
+  });
+
+  return response;
+};
+
+const response = await callModel({
+  client,
+  system: "Resume el texto del usuario en 3 puntos principales.",
+  messages: [{ role: "user", content: prompt }],
+  maxTokens,
 });
 
 if (values.json) {
