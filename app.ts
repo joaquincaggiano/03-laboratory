@@ -1,12 +1,13 @@
 import "dotenv/config"; // carga la clave y la dirección del servicio desde .env
-import OpenAI from "openai";
+import OpenAI, {
+  APIConnectionError,
+  APIConnectionTimeoutError,
+  APIError,
+} from "openai";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { ChatCompletion } from "openai/resources";
 import { ChatCompletionMessageParam } from "openai/resources.js";
-
-const client = new OpenAI(); // lee OPENAI_API_KEY y OPENAI_BASE_URL del entorno
-const MODELO = process.env.MODELO ?? "fast";
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -14,9 +15,25 @@ const { values, positionals } = parseArgs({
     json: { type: "boolean", default: false },
     "max-tokens": { type: "string" },
     stream: { type: "boolean", default: false },
-    // timeout: { type: "string" },
+    timeout: { type: "string" },
+    "fake-status": { type: "string" }, // solo pruebas: simula un error con ese status
   },
 });
+
+let timeout: number | undefined;
+if (values.timeout) {
+  timeout = parseFloat(values.timeout);
+  if (isNaN(timeout) || timeout <= 0) {
+    console.error("--timeout debe ser un número positivo.");
+    process.exit(1);
+  }
+}
+
+const client = new OpenAI({
+  timeout: timeout ? timeout * 1000 : undefined,
+  maxRetries: 0,
+}); // lee OPENAI_API_KEY y OPENAI_BASE_URL del entorno
+const MODELO = process.env.MODELO ?? "fast";
 
 // Límite de tokens de la respuesta
 let maxTokens = 256;
@@ -32,9 +49,9 @@ if (values["max-tokens"]) {
 let prompt = positionals[0];
 
 // Si no se proporcionó un prompt, mostramos un mensaje de como se utiliza la aplicación
-if (!prompt) {
+if (!prompt && !values["fake-status"]) {
   console.error(
-    `Para utilizar la aplicación, debes proporcionar un texto o archivo luego de ejecutar el comando:\n- npx tsx app.ts "<texto>" | <ruta-a-archivo> [--json]\n\nResume un texto en 3 puntos principales.\nOpciones:\n- --json: muestra la respuesta completa del modelo en formato JSON.\n- --max-tokens: límite de tokens de la respuesta (por defecto: 256).\n- --stream: muestra la respuesta del modelo de forma streaming.\n\nEjemplos:\n- npx tsx app.ts "Javascript es un lenguaje de programación ..."\n- npx tsx app.ts docs/texto.txt\n- npx tsx app.ts docs/texto.txt --json\n- npx tsx app.ts docs/texto.txt --stream`,
+    `Para utilizar la aplicación, debes proporcionar un texto o archivo luego de ejecutar el comando:\n- npx tsx app.ts "<texto>" | <ruta-a-archivo> [--json]\n\nResume un texto en 3 puntos principales.\nOpciones:\n- --json: muestra la respuesta completa del modelo en formato JSON.\n- --max-tokens: límite de tokens de la respuesta (por defecto: 256).\n- --stream: muestra la respuesta del modelo de forma streaming.\n- --timeout: tiempo de espera en segundos (por defecto: 30).\n- --fake-status: simula un error con ese status (por ejemplo 503).\n\nEjemplos:\n- npx tsx app.ts "Javascript es un lenguaje de programación ..."\n- npx tsx app.ts docs/texto.txt\n- npx tsx app.ts docs/texto.txt --json\n- npx tsx app.ts docs/texto.txt --stream\n- npx tsx app.ts docs/texto.txt --timeout 0.5\n- npx tsx app.ts docs/texto.txt --fake-status 503`,
   );
   process.exit(1);
 }
@@ -42,6 +59,61 @@ if (!prompt) {
 // Si el prompt es un archivo, leemos su contenido, sino se trata como texto y se usa tal cual
 if (existsSync(prompt) && statSync(prompt).isFile()) {
   prompt = readFileSync(prompt, "utf-8");
+}
+
+const isTransient = (error: unknown) => {
+  if (
+    error instanceof APIConnectionError ||
+    error instanceof APIConnectionTimeoutError
+  ) {
+    return true;
+  }
+  if (error instanceof APIError) {
+    return error.status === 429 || error.status >= 500;
+  }
+  return false;
+};
+
+const withRetries = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const maxRetries = 3;
+
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      // No se reintenta si el error no es transitorio o si era el último intento
+      if (!isTransient(error) || i >= maxRetries) throw error;
+
+      // jitter
+      const maxWaitSeconds = Math.min(30, 2 ** i);
+      const waitMs = Math.random() * maxWaitSeconds * 1000;
+      console.warn(
+        `Intento ${i + 1} fallido, reintentando en ${(waitMs / 1000).toFixed(2)} s...`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+};
+
+const fakeCallError = async (status: number) => {
+  throw APIError.generate(status, undefined, "fake error", new Headers());
+};
+
+// Prueba de reintentos sin gastar presupuesto: npx tsx app.ts --fake 503
+if (values["fake-status"]) {
+  const status = parseInt(values["fake-status"], 10);
+  if (!Number.isInteger(status)) {
+    console.error("--fake debe ser un código de estado, por ejemplo 503.");
+    process.exit(1);
+  }
+  try {
+    await withRetries(() => fakeCallError(status));
+  } catch (error) {
+    console.error(
+      `Error: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(1);
+  }
 }
 
 const readResponse = (res: ChatCompletion) => {
@@ -93,11 +165,13 @@ const callModel = async ({
   const start = performance.now();
 
   if (stream) {
-    const chunks = await client.chat.completions.create({
-      ...params,
-      stream: true,
-      stream_options: { include_usage: true },
-    });
+    const chunks = await withRetries(() =>
+      client.chat.completions.create({
+        ...params,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+    );
 
     let text = "";
     let finishReason: ChatCompletion.Choice["finish_reason"] = "stop";
@@ -148,20 +222,31 @@ const callModel = async ({
     };
   }
 
-  const response = await client.chat.completions.create(params);
+  const response = await withRetries(() =>
+    client.chat.completions.create(params),
+  );
   console.log(
     `\nTiempo total (sin streaming): ${(performance.now() - start).toFixed(0)} ms`,
   );
   return response;
 };
 
-const response = await callModel({
-  client,
-  system: "Resume el texto del usuario en 3 puntos principales.",
-  messages: [{ role: "user", content: prompt }],
-  maxTokens,
-  stream: values.stream,
-});
+let response: ChatCompletion;
+try {
+  response = await callModel({
+    client,
+    system: "Resume el texto del usuario en 3 puntos principales.",
+    messages: [{ role: "user", content: prompt }],
+    maxTokens,
+    stream: values.stream,
+  });
+} catch (error) {
+  // Error con --timeout 0.001
+  console.error(
+    `Error: ${error instanceof Error ? error.message : String(error)}`,
+  );
+  process.exit(1);
+}
 
 if (values.json) {
   console.log(JSON.stringify(response, null, 2));
